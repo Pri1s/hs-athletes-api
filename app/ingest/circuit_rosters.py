@@ -4,13 +4,15 @@ import argparse
 import json
 import re
 from dataclasses import asdict, dataclass, replace
+from datetime import datetime
 from typing import Iterable
-from urllib.parse import urljoin
+from urllib.parse import parse_qs, urljoin, urlparse
 
 import requests
 from bs4 import BeautifulSoup
 from sqlalchemy import text
 
+from app.ingest.box_score_contract import BoxScoreGame, BoxScorePlayerStats, validate_box_score_rows
 from app.logger import STAGE_DB_MAP, STAGE_DOWNLOAD, STAGE_PARSE, get_logger
 
 
@@ -76,6 +78,24 @@ def parse_int(value: str | None) -> int | None:
     return int(cleaned)
 
 
+def parse_stat_int(value: str | None) -> int | None:
+    cleaned = clean_text(value)
+    if cleaned is None:
+        return None
+    cleaned = cleaned.rstrip("+")
+    if not cleaned.isdigit():
+        return None
+    return int(cleaned)
+
+
+def parse_stat_pair(value: str | None) -> tuple[int | None, int | None]:
+    cleaned = clean_text(value)
+    if cleaned is None or "-" not in cleaned:
+        return None, None
+    made, attempted = cleaned.split("-", 1)
+    return parse_stat_int(made), parse_stat_int(attempted)
+
+
 def parse_height_inches(value: str | None) -> int | None:
     cleaned = clean_text(value)
     if not cleaned:
@@ -110,6 +130,15 @@ def expected_grad_year_from_grade(season_label: str, grade_level: int | None) ->
     if not match:
         return None
     return int(match.group(1)) + (13 - grade_level)
+
+
+def raise_parse_error(source_url: str, parsing_stage: str, message: str) -> None:
+    get_logger(STAGE_PARSE).error("%s source_url=%s parsing_stage=%s", message, source_url, parsing_stage)
+    raise ValueError(f"{message} for {source_url}")
+
+
+def log_parse_warning(source_url: str, parsing_stage: str, message: str) -> None:
+    get_logger(STAGE_PARSE).warning("%s source_url=%s parsing_stage=%s", message, source_url, parsing_stage)
 
 
 def ote_roster_url(team_slug: str) -> str:
@@ -317,7 +346,7 @@ def parse_eybl_roster(team: TeamRecord, html: str, season_label: str) -> list[Ro
     h1 = soup.find("h1")
     h1_text = clean_text(h1.get_text(" ", strip=True) if h1 else None)
     if not eybl_roster_matches_team(h1_text, team, season_label):
-        raise ValueError(f"EYBL roster unavailable or mismatched h1={h1_text!r}")
+        raise_parse_error(source_url, "eybl_roster_header", f"EYBL roster unavailable or mismatched h1={h1_text!r}")
 
     rows: list[RosterRow] = []
     for player in soup.select("li.sidearm-roster-player"):
@@ -332,8 +361,7 @@ def parse_eybl_roster(team: TeamRecord, html: str, season_label: str) -> list[Ro
             player_name = clean_text(image.get("alt"))
 
         if not player_name or not player_id:
-            get_logger(STAGE_PARSE).error("Missing EYBL player identity source_url=%s parsing_stage=player_card", source_url)
-            raise ValueError(f"Missing EYBL player identity for {source_url}")
+            raise_parse_error(source_url, "player_card", "Missing EYBL player identity")
 
         position_node = player.select_one(".sidearm-roster-player-position-long-short")
         if position_node and "hide-on-medium" in position_node.get("class", []):
@@ -375,8 +403,200 @@ def parse_eybl_roster(team: TeamRecord, html: str, season_label: str) -> list[Ro
         )
 
     if not rows:
-        raise ValueError(f"No EYBL roster rows found for {source_url}")
+        raise_parse_error(source_url, "eybl_roster_rows", "No EYBL roster rows found")
     return rows
+
+
+def eybl_box_score_external_game_id(source_url: str) -> str | None:
+    values = parse_qs(urlparse(source_url).query).get("id")
+    if not values:
+        return None
+    return values[0]
+
+
+def normalize_player_name(value: str | None) -> str | None:
+    cleaned = clean_text(value)
+    if not cleaned:
+        return None
+    if "," in cleaned:
+        last_name, first_name = [part.strip() for part in cleaned.split(",", 1)]
+        cleaned = clean_text(f"{first_name} {last_name}") or cleaned
+    return cleaned
+
+
+def player_identity_matches_team(identity: RosterRow, team_name: str) -> bool:
+    normalized_team = normalize_label(team_name)
+    identity_team = normalize_label(identity.team_name)
+    identity_slug = normalize_label(identity.team_slug)
+    return (
+        normalized_team == identity_team
+        or normalized_team == identity_slug
+        or identity_team.startswith(normalized_team)
+        or normalized_team.startswith(identity_team)
+    )
+
+
+def find_player_identity(
+    player_name: str,
+    team_name: str,
+    player_identities: Iterable[RosterRow],
+) -> RosterRow | None:
+    normalized_player = normalize_label(player_name)
+    candidates = [
+        identity
+        for identity in player_identities
+        if normalize_label(identity.player_name) == normalized_player
+    ]
+    team_candidates = [identity for identity in candidates if player_identity_matches_team(identity, team_name)]
+    if len(team_candidates) == 1:
+        return team_candidates[0]
+    if len(candidates) == 1:
+        return candidates[0]
+    return None
+
+
+def eybl_box_score_team_names(soup: BeautifulSoup, source_url: str) -> list[str]:
+    for table in soup.find_all("table"):
+        caption = table.find("caption")
+        if clean_text(caption.get_text(" ", strip=True) if caption else None) != "Team Score By Half":
+            continue
+        team_names = []
+        for row in table.find_all("tr")[1:]:
+            cells = row.find_all(["th", "td"])
+            team_name = clean_text(cells[0].get_text(" ", strip=True) if cells else None)
+            if team_name:
+                team_names.append(team_name)
+        if len(team_names) >= 2:
+            return team_names
+    raise_parse_error(source_url, "box_score_team_summary", "Missing EYBL box score team summary")
+
+
+def eybl_box_score_game_date(soup: BeautifulSoup, source_url: str):
+    for label in soup.find_all("dt"):
+        if clean_text(label.get_text(" ", strip=True)) != "Date":
+            continue
+        value = label.find_next_sibling("dd")
+        date_text = clean_text(value.get_text(" ", strip=True) if value else None)
+        if date_text:
+            return datetime.strptime(date_text, "%m/%d/%Y").date()
+    raise_parse_error(source_url, "box_score_game_date", "Missing EYBL box score date")
+
+
+def eybl_box_score_player_name(row) -> str | None:
+    player_header = row.find("th", scope="row")
+    if player_header is None:
+        return None
+    for jersey in player_header.select(".mobile-jersey-number"):
+        jersey.decompose()
+    return normalize_player_name(player_header.get_text(" ", strip=True))
+
+
+def parse_eybl_box_score(
+    html: str,
+    source_url: str,
+    player_identities: Iterable[RosterRow],
+    skip_unresolved_identities: bool = False,
+) -> list[BoxScorePlayerStats]:
+    soup = BeautifulSoup(html, "html.parser")
+    game_date = eybl_box_score_game_date(soup, source_url)
+    team_names = eybl_box_score_team_names(soup, source_url)
+    identity_rows = list(player_identities)
+    rows: list[BoxScorePlayerStats] = []
+
+    for table in soup.find_all("table"):
+        caption = table.find("caption")
+        caption_text = clean_text(caption.get_text(" ", strip=True) if caption else None)
+        if not caption_text or not caption_text.endswith(" - Team Statistics"):
+            continue
+
+        team_name = caption_text.removesuffix(" - Team Statistics")
+        opponent_name = next((name for name in team_names if normalize_label(name) != normalize_label(team_name)), None)
+        if opponent_name is None:
+            raise_parse_error(source_url, "box_score_opponent", f"Missing opponent for EYBL team {team_name}")
+
+        game = BoxScoreGame(
+            source_system="eybl_scholastic",
+            source_url=source_url,
+            game_date=game_date,
+            team_name=team_name,
+            opponent_name=opponent_name,
+            external_game_id=eybl_box_score_external_game_id(source_url),
+        )
+
+        for row in table.find_all("tr")[1:]:
+            player_name = eybl_box_score_player_name(row)
+            if not player_name or normalize_label(player_name) in {"totals", "team total"}:
+                continue
+
+            identity = find_player_identity(player_name, team_name, identity_rows)
+            if identity is None:
+                message = f"Missing EYBL player identity for {team_name} {player_name}"
+                if skip_unresolved_identities:
+                    log_parse_warning(source_url, "box_score_identity", message)
+                    continue
+                raise_parse_error(source_url, "box_score_identity", message)
+
+            stat_values = {
+                cell["data-label"]: clean_text(cell.get_text(" ", strip=True))
+                for cell in row.find_all("td")
+                if cell.get("data-label")
+            }
+            free_throws_made, free_throws_attempted = parse_stat_pair(stat_values.get("FT"))
+            rows.append(
+                BoxScorePlayerStats(
+                    game=game,
+                    player_name=identity.player_name,
+                    external_profile_id=identity.external_profile_id,
+                    profile_url=identity.profile_url,
+                    points=parse_stat_int(stat_values.get("PTS")),
+                    rebounds=parse_stat_int(stat_values.get("REB")),
+                    assists=parse_stat_int(stat_values.get("A")),
+                    steals=parse_stat_int(stat_values.get("STL")),
+                    blocks=parse_stat_int(stat_values.get("BLK")),
+                    minutes_played=parse_stat_int(stat_values.get("MIN")),
+                    free_throws_made=free_throws_made,
+                    free_throws_attempted=free_throws_attempted,
+                    turnovers=parse_stat_int(stat_values.get("TO")),
+                    fouls=parse_stat_int(stat_values.get("PF")),
+                )
+            )
+
+    try:
+        return validate_box_score_rows(rows)
+    except (TypeError, ValueError) as exc:
+        raise_parse_error(source_url, "box_score_rows", str(exc))
+
+
+def find_eybl_team_for_box_score_name(team_name: str, teams: Iterable[TeamRecord]) -> TeamRecord | None:
+    normalized_team = normalize_label(team_name)
+    for team in teams:
+        normalized_record_name = normalize_label(team.team_name)
+        normalized_slug = normalize_label(team.team_slug)
+        if (
+            normalized_team == normalized_record_name
+            or normalized_team == normalized_slug
+            or normalized_record_name.startswith(normalized_team)
+            or normalized_team.startswith(normalized_record_name)
+        ):
+            return team
+    return None
+
+
+def scrape_eybl_box_score(source_url: str, season_label: str) -> list[BoxScorePlayerStats]:
+    html = fetch_html(source_url)
+    soup = BeautifulSoup(html, "html.parser")
+    box_score_team_names = eybl_box_score_team_names(soup, source_url)
+    eybl_teams = discover_eybl_teams()
+    roster_rows: list[RosterRow] = []
+
+    for team_name in box_score_team_names:
+        team = find_eybl_team_for_box_score_name(team_name, eybl_teams)
+        if team is None:
+            raise_parse_error(source_url, "box_score_team_roster", f"Missing EYBL roster team for {team_name}")
+        roster_url = team.roster_url or eybl_roster_url(team.team_slug, season_label)
+        roster_rows.extend(parse_eybl_roster(replace(team, roster_url=roster_url), fetch_html(roster_url), season_label))
+
+    return parse_eybl_box_score(html, source_url, roster_rows, skip_unresolved_identities=True)
 
 
 def scrape_eybl_rosters(season_label: str) -> tuple[list[TeamRecord], list[RosterRow], list[str]]:
@@ -596,12 +816,53 @@ def build_payload(teams: list[TeamRecord], rows: list[RosterRow], skipped: list[
     }
 
 
+def box_score_row_payload(row: BoxScorePlayerStats) -> dict[str, object]:
+    return {
+        "game": {
+            "source_system": row.game.source_system,
+            "source_url": row.game.source_url,
+            "external_game_id": row.game.external_game_id,
+            "game_date": row.game.game_date.isoformat(),
+            "team_name": row.game.team_name,
+            "opponent_name": row.game.opponent_name,
+        },
+        "player_name": row.player_name,
+        "external_profile_id": row.external_profile_id,
+        "profile_url": row.profile_url,
+        "points": row.points,
+        "rebounds": row.rebounds,
+        "assists": row.assists,
+        "steals": row.steals,
+        "blocks": row.blocks,
+        "minutes_played": row.minutes_played,
+        "free_throws_made": row.free_throws_made,
+        "free_throws_attempted": row.free_throws_attempted,
+        "turnovers": row.turnovers,
+        "fouls": row.fouls,
+    }
+
+
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Scrape Sprint 1 circuit roster rows for S1-007.")
+    parser = argparse.ArgumentParser(description="Scrape Sprint 1 circuit roster and EYBL box-score rows.")
     parser.add_argument("--season-label", default=DEFAULT_SEASON_LABEL)
     parser.add_argument("--source", choices=("ote", "eybl", "all"), default="all")
     parser.add_argument("--load", action="store_true", help="Upsert rows into the configured database.")
+    parser.add_argument("--eybl-box-score-url", help="Fetch one EYBL box-score page and emit S1-008 contract rows.")
     args = parser.parse_args()
+
+    if args.eybl_box_score_url:
+        rows = scrape_eybl_box_score(args.eybl_box_score_url, args.season_label)
+        print(
+            json.dumps(
+                {
+                    "box_score_row_count": len(rows),
+                    "box_score_rows": [box_score_row_payload(row) for row in rows],
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        return
 
     teams, rows, skipped = scrape_rosters(args.source, args.season_label)
     print(json.dumps(build_payload(teams, rows, skipped), indent=2, sort_keys=True))
