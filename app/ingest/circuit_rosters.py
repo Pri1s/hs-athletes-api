@@ -251,6 +251,44 @@ def scrape_ote_rosters(season_label: str) -> tuple[list[TeamRecord], list[Roster
     return list(parsed_teams.values()), rows, skipped
 
 
+def scrape_ote_player_index(season_label: str) -> list[RosterRow]:
+    source_url = f"{OTE_BASE_URL}/players"
+    soup = BeautifulSoup(fetch_html(source_url), "html.parser")
+    rows: dict[str, RosterRow] = {}
+    for link in soup.select("a[href^='/players/']"):
+        href = clean_text(link.get("href"))
+        if not href:
+            continue
+        profile_url = urljoin(OTE_BASE_URL, href)
+        external_profile_id = profile_url.rstrip("/").rsplit("/", 1)[-1]
+        image = link.find("img")
+        player_name = clean_text(image.get("alt") if image else None)
+        if not player_name:
+            link_text = clean_text(link.get_text(" ", strip=True))
+            player_name = re.sub(r"^\d+\s+", "", link_text or "")
+            player_name = player_name.split(" Guard ")[0].split(" Forward ")[0].split(" Center ")[0]
+            player_name = clean_text(player_name)
+        if not player_name or not external_profile_id:
+            continue
+        rows[external_profile_id] = RosterRow(
+            source_system="overtime_elite",
+            governing_body="OTE",
+            source_url=source_url,
+            parsing_stage="ote_player_index",
+            team_name="OTE",
+            team_slug="players",
+            player_name=player_name,
+            external_profile_id=external_profile_id,
+            profile_url=profile_url,
+            season_label=season_label,
+            jersey_number=None,
+            position=None,
+        )
+    if not rows:
+        raise_parse_error(source_url, "ote_player_index", "No OTE player index rows found")
+    return list(rows.values())
+
+
 def eybl_roster_url(team_slug: str, season_label: str) -> str:
     return f"{EYBL_BASE_URL}/sports/mbball/{team_slug}/roster/{season_label}?path=mbball"
 
@@ -453,6 +491,182 @@ def find_player_identity(
     if len(candidates) == 1:
         return candidates[0]
     return None
+
+
+def json_ld_objects(soup: BeautifulSoup) -> list[dict[str, object]]:
+    objects: list[dict[str, object]] = []
+    for script in soup.find_all("script", attrs={"type": "application/ld+json"}):
+        try:
+            payload = json.loads(script.string or "")
+        except json.JSONDecodeError:
+            continue
+        if isinstance(payload, dict):
+            objects.append(payload)
+        elif isinstance(payload, list):
+            objects.extend(item for item in payload if isinstance(item, dict))
+    return objects
+
+
+def ote_box_score_external_game_id(source_url: str) -> str | None:
+    match = re.search(r"/games/([^/]+)", urlparse(source_url).path)
+    if not match:
+        return None
+    return match.group(1)
+
+
+def ote_box_score_game_date(soup: BeautifulSoup, source_url: str):
+    for item in json_ld_objects(soup):
+        if item.get("@type") != "SportsEvent":
+            continue
+        start_date = clean_text(str(item.get("startDate") or ""))
+        if start_date:
+            return datetime.fromisoformat(start_date.replace("Z", "+00:00")).date()
+
+    time_node = soup.find("time")
+    date_time = clean_text(time_node.get("datetime") if time_node else None)
+    if date_time:
+        return datetime.fromisoformat(date_time.replace("Z", "+00:00")).date()
+    raise_parse_error(source_url, "ote_box_score_game_date", "Missing OTE box score date")
+
+
+def ote_box_score_team_names(soup: BeautifulSoup, source_url: str) -> list[str]:
+    for table in soup.find_all("table"):
+        header_labels = [
+            normalize_label(header.get_text(" ", strip=True))
+            for header in table.find_all("th")
+        ]
+        if "t total" not in header_labels and "total" not in header_labels:
+            continue
+
+        team_names = []
+        for row in table.find_all("tr")[1:]:
+            team_cell = row.find("th")
+            if team_cell is None:
+                continue
+            desktop_name = team_cell.select_one(".desktop-only")
+            team_name = clean_text(desktop_name.get_text(" ", strip=True) if desktop_name else None)
+            if not team_name:
+                team_name = clean_text(team_cell.get_text(" ", strip=True))
+            if team_name:
+                team_names.append(team_name)
+        if len(team_names) >= 2:
+            return team_names[:2]
+    raise_parse_error(source_url, "ote_box_score_team_summary", "Missing OTE box score team summary")
+
+
+def ote_stat_header_labels(table) -> list[str]:
+    header_row = table.find("tr")
+    if header_row is None:
+        return []
+    labels = []
+    for cell in header_row.find_all(["th", "td"]):
+        label = clean_text(cell.get_text(" ", strip=True))
+        labels.append(label.lower().split()[0] if label else "")
+    return labels
+
+
+def ote_box_score_player_name(row) -> str | None:
+    player_header = row.find("th")
+    if player_header is None:
+        return None
+    name_node = player_header.select_one(".Name")
+    image = player_header.find("img", attrs={"alt": True})
+    player_name = clean_text(name_node.get_text(" ", strip=True) if name_node else None)
+    if not player_name and image:
+        player_name = clean_text(image.get("alt"))
+    if not player_name:
+        player_name = clean_text(player_header.get_text(" ", strip=True))
+    if not player_name:
+        return None
+    return clean_text(re.sub(r"^\d+\s+", "", player_name))
+
+
+def is_ote_team_total_row(player_name: str, team_name: str) -> bool:
+    normalized_player = normalize_label(player_name)
+    normalized_team = normalize_label(team_name)
+    return normalized_player == normalized_team or normalized_team.endswith(normalized_player)
+
+
+def parse_ote_box_score(
+    html: str,
+    source_url: str,
+    player_identities: Iterable[RosterRow],
+    skip_unresolved_identities: bool = False,
+) -> list[BoxScorePlayerStats]:
+    soup = BeautifulSoup(html, "html.parser")
+    game_date = ote_box_score_game_date(soup, source_url)
+    team_names = ote_box_score_team_names(soup, source_url)
+    identity_rows = list(player_identities)
+    rows: list[BoxScorePlayerStats] = []
+    stats_tables = [
+        table
+        for table in soup.find_all("table")
+        if ote_stat_header_labels(table)[:2] == ["player", "pts"]
+    ]
+
+    for table, team_name in zip(stats_tables, team_names):
+        opponent_name = next((name for name in team_names if normalize_label(name) != normalize_label(team_name)), None)
+        if opponent_name is None:
+            raise_parse_error(source_url, "ote_box_score_opponent", f"Missing opponent for OTE team {team_name}")
+
+        game = BoxScoreGame(
+            source_system="overtime_elite",
+            source_url=source_url,
+            game_date=game_date,
+            team_name=team_name,
+            opponent_name=opponent_name,
+            external_game_id=ote_box_score_external_game_id(source_url),
+        )
+
+        labels = ote_stat_header_labels(table)
+        for row in table.find_all("tr")[1:]:
+            player_name = ote_box_score_player_name(row)
+            if not player_name or is_ote_team_total_row(player_name, team_name):
+                continue
+
+            identity = find_player_identity(player_name, team_name, identity_rows)
+            if identity is None:
+                message = f"Missing OTE player identity for {team_name} {player_name}"
+                if skip_unresolved_identities:
+                    log_parse_warning(source_url, "ote_box_score_identity", message)
+                    continue
+                raise_parse_error(source_url, "ote_box_score_identity", message)
+
+            cells = row.find_all("td")
+            stat_values = {
+                label: clean_text(cell.get_text(" ", strip=True))
+                for label, cell in zip(labels[1:], cells)
+                if label
+            }
+            rows.append(
+                BoxScorePlayerStats(
+                    game=game,
+                    player_name=identity.player_name,
+                    external_profile_id=identity.external_profile_id,
+                    profile_url=identity.profile_url,
+                    points=parse_stat_int(stat_values.get("pts")),
+                    rebounds=parse_stat_int(stat_values.get("reb")),
+                    assists=parse_stat_int(stat_values.get("ast")),
+                    steals=parse_stat_int(stat_values.get("stl")),
+                    blocks=parse_stat_int(stat_values.get("blk")),
+                    minutes_played=parse_stat_int(stat_values.get("min")),
+                    free_throws_made=parse_stat_int(stat_values.get("ftm")),
+                    free_throws_attempted=parse_stat_int(stat_values.get("fta")),
+                    turnovers=parse_stat_int(stat_values.get("to")),
+                    fouls=parse_stat_int(stat_values.get("pf")),
+                )
+            )
+
+    try:
+        return validate_box_score_rows(rows)
+    except (TypeError, ValueError) as exc:
+        raise_parse_error(source_url, "ote_box_score_rows", str(exc))
+
+
+def scrape_ote_box_score(source_url: str, season_label: str) -> list[BoxScorePlayerStats]:
+    html = fetch_html(source_url)
+    player_rows = scrape_ote_player_index(season_label)
+    return parse_ote_box_score(html, source_url, player_rows, skip_unresolved_identities=True)
 
 
 def eybl_box_score_team_names(soup: BeautifulSoup, source_url: str) -> list[str]:
@@ -843,15 +1057,30 @@ def box_score_row_payload(row: BoxScorePlayerStats) -> dict[str, object]:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Scrape Sprint 1 circuit roster and EYBL box-score rows.")
+    parser = argparse.ArgumentParser(description="Scrape Sprint 1 circuit roster and box-score rows.")
     parser.add_argument("--season-label", default=DEFAULT_SEASON_LABEL)
     parser.add_argument("--source", choices=("ote", "eybl", "all"), default="all")
     parser.add_argument("--load", action="store_true", help="Upsert rows into the configured database.")
     parser.add_argument("--eybl-box-score-url", help="Fetch one EYBL box-score page and emit S1-008 contract rows.")
+    parser.add_argument("--ote-box-score-url", help="Fetch one OTE box-score page and emit S1-008 contract rows.")
     args = parser.parse_args()
 
     if args.eybl_box_score_url:
         rows = scrape_eybl_box_score(args.eybl_box_score_url, args.season_label)
+        print(
+            json.dumps(
+                {
+                    "box_score_row_count": len(rows),
+                    "box_score_rows": [box_score_row_payload(row) for row in rows],
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        return
+
+    if args.ote_box_score_url:
+        rows = scrape_ote_box_score(args.ote_box_score_url, args.season_label)
         print(
             json.dumps(
                 {
