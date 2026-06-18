@@ -9,6 +9,7 @@ from sqlalchemy import text
 
 from app.ingest.box_score_contract import BoxScoreGame, BoxScorePlayerStats, validate_box_score_rows
 from app.ingest.circuit_rosters import TeamRecord, RosterRow, upsert_teams
+from app.ingest.stat_loader import load_box_score_rows
 
 
 BENCHMARK_SOURCE_SYSTEM = "overtime_elite"
@@ -230,158 +231,8 @@ def upsert_benchmark_rosters(conn) -> dict[str, int]:
 
 
 def seed_benchmark_game(conn) -> dict[str, int]:
-    player_ids = upsert_benchmark_rosters(conn)
-
-    conn.execute(
-        text(
-            """
-            insert into sources (url, source_system, fetched_at, parsing_stage)
-            values (:url, :source_system, now(), :parsing_stage)
-            on conflict (url) do update
-            set fetched_at = excluded.fetched_at,
-                source_system = excluded.source_system,
-                parsing_stage = excluded.parsing_stage
-            """
-        ),
-        {
-            "url": BENCHMARK_SOURCE_URL,
-            "source_system": BENCHMARK_SOURCE_SYSTEM,
-            "parsing_stage": "benchmark_game",
-        },
-    )
-
-    team_ids = {
-        row._mapping["name"]: row._mapping["id"]
-        for row in conn.execute(
-            text(
-                """
-                select id, name
-                from teams
-                where governing_body = :governing_body
-                  and name in (:home_team, :away_team)
-                """
-            ),
-            {
-                "governing_body": BENCHMARK_GOVERNING_BODY,
-                "home_team": BENCHMARK_HOME_TEAM,
-                "away_team": BENCHMARK_AWAY_TEAM,
-            },
-        )
-    }
-    home_team_id = team_ids[BENCHMARK_HOME_TEAM]
-    away_team_id = team_ids[BENCHMARK_AWAY_TEAM]
-
-    game_id = conn.execute(
-        text(
-            """
-            select id
-            from games
-            where game_date = :game_date
-              and home_team_id = :home_team_id
-              and away_team_id = :away_team_id
-            """
-        ),
-        {
-            "game_date": BENCHMARK_GAME_DATE,
-            "home_team_id": home_team_id,
-            "away_team_id": away_team_id,
-        },
-    ).scalar_one_or_none()
-
-    if game_id is None:
-        game_id = conn.execute(
-            text(
-                """
-                insert into games (game_date, home_team_id, away_team_id, timing_structure)
-                values (:game_date, :home_team_id, :away_team_id, :timing_structure)
-                returning id
-                """
-            ),
-            {
-                "game_date": BENCHMARK_GAME_DATE,
-                "home_team_id": home_team_id,
-                "away_team_id": away_team_id,
-                "timing_structure": None,
-            },
-        ).scalar_one()
-
-    conn.execute(
-        text(
-            """
-            delete from game_stats
-            where game_id = :game_id
-              and source_url = :source_url
-            """
-        ),
-        {"game_id": game_id, "source_url": BENCHMARK_SOURCE_URL},
-    )
-
-    inserted_stats = 0
-    for row in benchmark_game_rows():
-        team_id = team_ids[row.game.team_name]
-        player_id = player_ids[row.external_profile_id]
-        conn.execute(
-            text(
-                """
-                insert into game_stats (
-                    player_id,
-                    game_id,
-                    team_id,
-                    source_url,
-                    points,
-                    rebounds,
-                    assists,
-                    steals,
-                    blocks,
-                    turnovers,
-                    ft_made,
-                    ft_att,
-                    fouls,
-                    min_played
-                )
-                values (
-                    :player_id,
-                    :game_id,
-                    :team_id,
-                    :source_url,
-                    :points,
-                    :rebounds,
-                    :assists,
-                    :steals,
-                    :blocks,
-                    :turnovers,
-                    :ft_made,
-                    :ft_att,
-                    :fouls,
-                    :min_played
-                )
-                """
-            ),
-            {
-                "player_id": player_id,
-                "game_id": game_id,
-                "team_id": team_id,
-                "source_url": row.game.source_url,
-                "points": row.points,
-                "rebounds": row.rebounds,
-                "assists": row.assists,
-                "steals": row.steals,
-                "blocks": row.blocks,
-                "turnovers": row.turnovers,
-                "ft_made": row.free_throws_made,
-                "ft_att": row.free_throws_attempted,
-                "fouls": row.fouls,
-                "min_played": row.minutes_played,
-            },
-        )
-        inserted_stats += 1
-
-    return {
-        "games": 1,
-        "game_stats": inserted_stats,
-        "players": len(player_ids),
-        "teams": len(team_ids),
-    }
+    upsert_benchmark_rosters(conn)
+    return load_box_score_rows(conn, benchmark_game_rows())
 
 
 def benchmark_payload() -> dict[str, object]:

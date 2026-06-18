@@ -13,6 +13,7 @@ from bs4 import BeautifulSoup
 from sqlalchemy import text
 
 from app.ingest.box_score_contract import BoxScoreGame, BoxScorePlayerStats, validate_box_score_rows
+from app.ingest.stat_loader import load_box_score_rows
 from app.logger import STAGE_DB_MAP, STAGE_DOWNLOAD, STAGE_PARSE, get_logger
 
 
@@ -1077,6 +1078,12 @@ def main() -> None:
                 sort_keys=True,
             )
         )
+        if args.load:
+            from app.db import engine
+
+            with engine.begin() as conn:
+                counts = load_box_score_rows(conn, rows)
+            print(json.dumps({"loaded": counts}, indent=2, sort_keys=True))
         return
 
     if args.ote_box_score_url:
@@ -1091,6 +1098,12 @@ def main() -> None:
                 sort_keys=True,
             )
         )
+        if args.load:
+            from app.db import engine
+
+            with engine.begin() as conn:
+                counts = load_box_score_rows(conn, rows)
+            print(json.dumps({"loaded": counts}, indent=2, sort_keys=True))
         return
 
     teams, rows, skipped = scrape_rosters(args.source, args.season_label)
